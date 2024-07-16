@@ -3,7 +3,8 @@ import unittest
 
 from rockit import Ocp, DirectMethod, MultipleShooting, FreeTime, DirectCollocation, SingleShooting, SplineMethod, UniformGrid, GeometricGrid, FreeGrid, LseGroup, rockit_pickle_context, rockit_unpickle_context
 from problems import integrator_control_problem, vdp, vdp_dae, bang_bang_problem
-from casadi import DM, jacobian, sum1, sum2, MX, rootfinder, evalf, sumsqr, symvar
+from casadi import DM, jacobian, sum1, sum2, MX, rootfinder, evalf, sumsqr, symvar, vertcat
+import casadi as ca
 from numpy import sin, pi, linspace
 from numpy.testing import assert_array_almost_equal
 from rockit.splines.spline import Spline
@@ -54,6 +55,143 @@ class MiscTests(unittest.TestCase):
       ocp, x, u = integrator_control_problem()
       sol = ocp.solve()
       self.assertAlmostEqual(sol.value(ocp.objective),sol.value(ocp.at_tf(x)))
+
+    def test_splinemethod_order0(self):
+      for method in [MultipleShooting(N=10),SplineMethod(N=10)]:
+         for order in [0,1]:
+            # Only control
+            ocp = Ocp(T=1)
+
+            x = ocp.control(order=order)
+            ocp.add_objective(ocp.sum(sumsqr(x-ocp.t),include_last=True))
+            ocp.solver('ipopt')
+
+            ocp.method(method)
+
+            # Solve
+            sol = ocp.solve()
+            [t,xs] = sol.sample(x, grid='control')
+            if order==1:
+              assert_array_almost_equal(t, xs)
+            if order==0:
+              assert_array_almost_equal(t[:-2], xs[:-2])
+              assert_array_almost_equal(xs[-2:],0.95)
+
+            if "SplineMethod" in str(method):
+              print(sol.sample(x, grid='gist'))
+
+            ocp = Ocp(T=1)
+
+            # Only variables
+            ocp = Ocp(T=1)
+
+            x = ocp.variable(grid='bspline',order=order)
+            ocp.add_objective(ocp.sum(sumsqr(x-ocp.t),include_last=True))
+            ocp.solver('ipopt')
+
+            ocp.method(method)
+
+            # Solve
+            sol = ocp.solve()
+            [t,xs] = sol.sample(x, grid='control')
+            if order==1:
+              assert_array_almost_equal(t, xs)
+            if order==0:
+              assert_array_almost_equal(t[:-2], xs[:-2])
+              assert_array_almost_equal(xs[-2:],0.95)
+
+
+    def test_grid_gist(self):
+      for order in range(3):
+        ocp = Ocp(T=1)
+        x = ocp.control(2,order=order)
+        ocp.add_objective(ocp.sum(sumsqr(x-ocp.t),include_last=True))
+        ocp.solver('ipopt')
+        ocp.method(SplineMethod(N=10))
+        sol = ocp.solve()
+
+        [_,xs] = sol.sample(x, grid='gist')
+        self.assertEqual(xs.shape[0], 10+order)
+        [_,xs2] = sol.sample(7*x+1.7, grid='gist')
+        assert_array_almost_equal(7*xs+1.7,xs2)
+        [_,xs2] = sol.sample(vertcat(3*x[0]+1.3,x[1]+1.7), grid='gist')
+        assert_array_almost_equal(xs[:,0]*3+1.3,xs2[:,0])
+        assert_array_almost_equal(xs[:,1]+1.7,xs2[:,1])
+        [_,xs2] = sol.sample(vertcat(x[1]+1.3,3*x[0]+1.7), grid='gist')
+        assert_array_almost_equal(xs[:,1]+1.3,xs2[:,0])
+        assert_array_almost_equal(xs[:,0]*3+1.7,xs2[:,1])
+        [_,xs] = ocp.sample(x, grid='gist')
+        self.assertEqual(xs.shape[1], 10+order)
+
+        ocp = Ocp(T=1)
+        x = ocp.variable(2,grid='bspline',order=order)
+        ocp.add_objective(ocp.sum(sumsqr(x-ocp.t),include_last=True))
+        ocp.solver('ipopt')
+        ocp.method(SplineMethod(N=10))
+        sol = ocp.solve()
+
+        [_,xs] = sol.sample(x, grid='gist')
+        self.assertEqual(xs.shape[0], 10+order)
+        [_,xs2] = sol.sample(7*x+1, grid='gist')
+        assert_array_almost_equal(7*xs+1,xs2)
+        [_,xs] = ocp.sample(x, grid='gist')
+        self.assertEqual(xs.shape[1], 10+order)
+
+        ocp = Ocp(T=1)
+        x = ocp.parameter(2,grid='bspline',order=order)
+        DM.rng(1)
+        ocp.set_value(x, DM.rand(2,10+order))
+        ocp.add_objective(ocp.sum(sumsqr(x),include_last=True))
+        ocp.solver('ipopt')
+        ocp.method(SplineMethod(N=10))
+        sol = ocp.solve()
+
+        [_,xs] = sol.sample(x, grid='gist')
+        self.assertEqual(xs.shape[0], 10+order)
+        [_,xs2] = sol.sample(7*x+1, grid='gist')
+        assert_array_almost_equal(7*xs+1,xs2)
+        [_,xs] = ocp.sample(x, grid='gist')
+        self.assertEqual(xs.shape[1], 10+order)
+
+    def test_der_signals(self):
+      for grid in [None,'inf']:
+        # Only variables
+        ocp = Ocp(T=1.3)
+
+        x = ocp.variable(grid='bspline',order=2)
+        ocp.subject_to(ocp.at_t0(x)==0)
+        ocp.add_objective(-ocp.at_tf(x))
+
+        ocp.subject_to(ocp.der(x)<=1.1,grid=grid)
+        ocp.solver('ipopt')
+        ocp.method(SplineMethod(N=10))
+        sol = ocp.solve()
+
+        assert_array_almost_equal(sol.sample(ocp.der(x),grid='gist')[1], 1.1)
+
+        self.assertAlmostEqual(sol.value(ocp.at_tf(x)),1.3*1.1)
+
+    def test_p_bspline(self):
+      ocp = Ocp(T=1)
+      x = ocp.control(order=2)
+
+      p = ocp.parameter(grid='bspline',order=2)
+      ocp.add_objective(ocp.sum(sumsqr(x-p),include_last=True))
+      DM.rng(1)
+      coeff = DM.rand(1,12)
+      ocp.set_value(p, coeff)
+      ocp.solver('ipopt')
+      ocp.method(SplineMethod(N=10))
+
+      # Solve
+      sol = ocp.solve()
+      [_,xs] = sol.sample(x, grid='gist')
+      #print(xs.shape)
+      #print(np.array(coeff).squeeze().shape)
+      #assert_array_almost_equal(np.array(coeff).squeeze(), xs)
+
+      [_,ds] = sol.sample(x-p, grid='control')
+      assert_array_almost_equal(ds, 0)
 
     def test_basic(self):
         for T in [1, 3.2]:
@@ -266,7 +404,38 @@ class MiscTests(unittest.TestCase):
       self.assertAlmostEqual(xs[0], 1)
 
     def test_initial(self):
-      for stage_method in [MultipleShooting(), DirectCollocation(), SplineMethod()]:
+      for stage_method in [SingleShooting(),MultipleShooting(), DirectCollocation(), SplineMethod()]:
+        ocp, x, u = integrator_control_problem(x0=None,stage_method=stage_method)
+
+        ocp = Ocp(T=1)
+
+        x = ocp.state()
+        u = ocp.control()
+        if "SplineMethod" in str(stage_method):
+           ocp.set_der(x, u)
+        else:
+          p = ocp.parameter()
+          ocp.set_value(p,1)
+          ocp.set_der(x, p*u)
+
+        ocp.subject_to(-1 <= (u <= 1))
+
+        ocp.add_objective(ocp.at_tf(sin(x))+ocp.integral(u**2))
+
+        ocp.solver('ipopt')
+
+        ocp.method(stage_method)
+
+        ocp.set_initial(x, -pi/2+0.1)
+        sol = ocp.solve()
+        ts, xs = sol.sample(x, grid='control')
+        self.assertAlmostEqual(xs[0], -pi/2, places=6)
+        ocp.set_initial(x, 2*pi-pi/2+0.1)
+        sol = ocp.solve()
+        ts, xs = sol.sample(x, grid='control')
+        self.assertAlmostEqual(xs[0], 2*pi-pi/2, places=6)
+
+      for stage_method in [SingleShooting(),MultipleShooting(), DirectCollocation(), SplineMethod()]:
         ocp, x, u = integrator_control_problem(x0=None,stage_method=stage_method)
         v = ocp.variable()
         ocp.subject_to(ocp.at_t0(x)==v)
@@ -333,7 +502,7 @@ class MiscTests(unittest.TestCase):
         ocp.set_der(x, 0)
         ocp.subject_to(ocp.at_t0(x)==0)
 
-        ts = linspace(0, 10, N)
+        ts = linspace(0, 10, N+1)[:-1]
 
         ocp.add_objective(ocp.integral(sin(v-p)**2,grid='control'))
         ocp.method(MultipleShooting(N=N))
@@ -425,6 +594,46 @@ class MiscTests(unittest.TestCase):
             x_ref = I(t0+T)-I(t0)
 
             assert_array_almost_equal(xs[-1],x_ref)
+
+    def test_quad(self):
+    
+    
+        for M in [1,2]:
+            methods = [SingleShooting(N=3,M=M),
+                           MultipleShooting(N=3,M=M),
+                           DirectCollocation(N=3,M=M)]
+        
+            for method in methods:
+                ocp = Ocp(T=6)
+                
+                u = ocp.control()
+                q = ocp.state(quad=True)
+                q2 = ocp.state(quad=True)
+                ocp.set_der(q, u)
+                ocp.set_der(q2, u**2)
+
+                ocp.add_objective(ocp.integral(sumsqr(u-sin(ocp.t)))+ocp.at_tf(q2)**2)
+                ocp.subject_to(ocp.at_tf(q)==2)
+                ocp.solver('ipopt')
+                ocp.method(method)
+                sol = ocp.solve()
+                
+                for kwargs in [{"grid":"control"},{"grid":"integrator"},{"grid":"integrator","refine":4}]:
+                    refine = kwargs["refine"] if "refine" in kwargs else None
+                    
+                    if isinstance(method,DirectCollocation):
+                        continue
+          
+                    [_,usol] = sol.sample(u,**kwargs)
+                    [_,qsol] = sol.sample(q,**kwargs)
+                    
+                    q_ref = np.array(vertcat(0,2*np.cumsum(usol[:-1]))).squeeze()
+                    if refine is not None:
+                        q_ref = q_ref/refine
+                    if kwargs["grid"]=="integrator":
+                        q_ref = q_ref/M
+
+                    assert_array_almost_equal(qsol,q_ref)
 
     def test_collocation_equivalence(self):
 
@@ -680,13 +889,15 @@ class MiscTests(unittest.TestCase):
         ocp.solver("ipopt",{"ipopt.tol":1e-12,"dump_in":True})
       
  
+        DM.rng(1)
         
         alg0 = np.round(DM.rand(N+1,1),decimals=3)
         x0 = np.round(DM.rand(2,N+1),decimals=3)
 
 
         ocp.set_initial(alg, MX(alg0)[ocp.t])
-        ocp.set_initial(ocp.x, MX(x0)[:,ocp.t])
+        ocp.set_initial(ocp.x, MX(x0)[:,ca.floor(ocp.t)])
+
         sol = ocp.solve()
         x0_ref = DM.from_file("solver.000000.in.x0.mtx")
 
@@ -850,6 +1061,97 @@ class MiscTests(unittest.TestCase):
       with self.assertRaisesRegex(Exception, "You attempted to set the initial value of an unknown symbol"):
         ocp.set_initial(y, 3)
 
+    def test_set_initial_alg(self):
+    
+      for method in [SingleShooting(N=10,intg='idas'),MultipleShooting(N=10,intg='idas'),DirectCollocation(N=10)]:
+        ocp = Ocp()
+        x = ocp.state()
+        zx = ocp.algebraic()
+        y = ocp.state()
+        zy = ocp.algebraic()
+        
+        ocp.add_alg(sin(zx))
+        ocp.add_alg(ca.cos(zy))
+        
+        u = ocp.control()
+        
+        ocp.set_der(x, u/zx)
+        ocp.set_der(y, u/zy)
+        
+        ocp.subject_to(ocp.at_t0(x)==0)
+        ocp.subject_to(ocp.at_t0(y)==0)
+        
+        ocp.add_objective(ocp.sum(u**2))
+        
+        ocp.subject_to(ocp.at_tf(x)==1)
+        
+        ocp.method(method)
+        ocp.solver("ipopt")
+        
+        with self.assertRaises(Exception):
+        	sol = ocp.solve()
+        
+        ocp.set_initial(zy, pi/2-0.1)
+        ocp.set_initial(zx, pi-0.1)
+        
+        sol = ocp.solve()
+        
+        np.testing.assert_allclose(sol.sample(zy,grid='control')[1],pi/2)
+        np.testing.assert_allclose(sol.sample(zx,grid='control')[1],pi)
+      
+      for method in [MultipleShooting(N=4,intg='idas'),SingleShooting(N=4,intg='idas'),DirectCollocation(N=4,scheme='legendre')]:
+        ocp = Ocp(T=4)
+        x = ocp.state()
+        zx = ocp.algebraic()
+        y = ocp.state()
+        zy = ocp.algebraic()
+        
+        ocp.add_alg(sin(zx))
+        ocp.add_alg(ca.cos(zy))
+        
+        ocp.set_initial(zy, pi/2+pi*ca.floor(ocp.t))
+        ocp.set_initial(zx, pi+pi*ca.floor(ocp.t))
+        
+        u = ocp.control()
+        
+        ocp.set_der(x, u/zx)
+        ocp.set_der(y, u/zy)
+        
+        ocp.subject_to(ocp.at_t0(x)==0)
+        ocp.subject_to(ocp.at_t0(y)==0)
+        
+        ocp.add_objective(ocp.sum(u**2))
+        
+        ocp.subject_to(ocp.at_tf(x)==1)
+        
+        ocp.method(method)
+        ocp.solver("ipopt")
+        
+        sol = ocp.solve()
+        
+        print(sol.sample(zy,grid='control')[1])
+        print(sol.sample(zx,grid='control')[1])
+        print(pi/2+pi*np.linspace(0,4,4+1))
+
+        if "MultipleShooting" in str(method):
+          # Note the first sample of z is based on discrete_system Zi[0] and Zi is the collection of integrator outputs zf.
+          # So for M=1, sampled z is same for k=0 and k=1.
+          
+
+          # Furthermore, the first zf here gets initial guess (pi/2), leading to pi/2 solution
+          np.testing.assert_allclose(sol.sample(zy,grid='control')[1],[pi/2,pi/2,pi/2+pi,pi/2+2*pi,pi/2+3*pi])
+          np.testing.assert_allclose(sol.sample(zx,grid='control')[1],[pi,pi,pi+pi,pi+2*pi,pi+3*pi])
+        elif "SingleShooting" in str(method):
+          # In single shooting, only the initial guess (pi/2) is used
+          np.testing.assert_allclose(sol.sample(zy,grid='control')[1],pi/2)
+          np.testing.assert_allclose(sol.sample(zx,grid='control')[1],pi)
+        elif "DirectCollocation" in str(method):
+          legendre = [pi/2]*4+[pi/2+pi]*4+[pi/2+2*pi]*4+[pi/2+3*pi]*4
+          np.testing.assert_allclose(sol.sample(zy,grid='integrator_roots')[1],legendre)
+          # Note sure if the answer below is desirable
+          np.testing.assert_allclose(sol.sample(zy,grid='control')[1],[pi/2,pi/2+pi,pi/2+2*pi,pi/2+3*pi,pi/2+3*pi])
+
+      
     def test_control_set_der(self):
       ocp = Ocp()
       x = ocp.state()
@@ -1253,6 +1555,128 @@ class MiscTests(unittest.TestCase):
 
         np.testing.assert_allclose(tr, t2,atol=1e-16)
         np.testing.assert_allclose(xr, x2,atol=1e-16)
+
+    def test_set_initial_bspline_variable(self):
+
+        ocp = Ocp(T=10)
+
+        def R_compress(R):
+            return ca.vec(R)
+
+
+        def R_decompress(Rc):
+            return ca.reshape(Rc,3,3)
+
+
+        Rc = ocp.variable(9, grid='bspline', order=4)
+        R = R_decompress(Rc)
+
+
+        ocp.subject_to(ocp.at_t0(R)==ca.DM.eye(3))
+
+        #ocp.subject_to(ca.vec(R.T @ R-ca.DM.eye(3))==0)
+
+        ocp.method(SplineMethod(N=5))
+
+        ocp.solver("ipopt",{"ipopt.max_iter":0})
+
+        print(ca.densify(R_compress(ca.DM.eye(3))))
+        ocp.set_initial(Rc,ca.densify(R_compress(ca.DM.eye(3))))
+
+        sol = ocp.solve_limited()
+
+        for Rc_sol in ca.vertsplit(sol.sample(Rc,grid='control')[1]):
+          assert_array_almost_equal(R_decompress(Rc_sol),DM.eye(3))
+
+    def test_variable_bspline(self):
+        
+        N = 3
+        M = 2
+        
+        for grid in [UniformGrid(),  GeometricGrid(2)]:
+          for degree in [1,2,0]:
+            ocp = Ocp(T=10)
+
+            # Define 2 states
+            x1 = ocp.state()
+            x2 = ocp.state()
+
+            # Define 1 control
+            u = ocp.control(order=degree)
+
+            # Specify ODE
+            ocp.set_der(x1, (1 - x2**2) * x1 - x2 + u)
+            ocp.set_der(x2, x1)
+
+            # Lagrange objective
+            ocp.add_objective(ocp.integral(x1**2 + x2**2 + u**2))
+
+            # Path constraints
+            ocp.subject_to(-1 <= (u <= 1))
+            ocp.subject_to(x1 >= -0.25, grid='integrator')
+
+            # Initial constraints
+            ocp.subject_to(ocp.at_t0(x1) == 0)
+            ocp.subject_to(ocp.at_t0(x2) == 1)
+
+            # Pick an NLP solver backend
+            ocp.solver('ipopt')
+
+            # Pick a solution method
+            ocp.method(DirectCollocation(N=N,M=M,grid=grid))
+            
+            sol = ocp.solve()
+
+            [_,urefsol_control] = sol.sample(u,grid='control')
+            [_,urefsol_integrator] = sol.sample(u,grid='integrator')
+            [_,urefsol_integrator_refine] = sol.sample(u,grid='integrator',refine=7)
+            [_,urefsol_integrator_roots] = sol.sample(u,grid='integrator_roots')
+
+
+            ocp = Ocp(T=10)
+
+            # Define 2 states
+            x1 = ocp.state()
+            x2 = ocp.state()
+
+            # Define 1 control
+            u = ocp.variable(grid='bspline',order=degree)
+
+            # Specify ODE
+            ocp.set_der(x1, (1 - x2**2) * x1 - x2 + u)
+            ocp.set_der(x2, x1)
+
+            # Lagrange objective
+            ocp.add_objective(ocp.integral(x1**2 + x2**2 + u**2))
+
+            # Path constraints
+            ocp.subject_to(-1 <= (u <= 1))
+            ocp.subject_to(x1 >= -0.25, grid='integrator')
+
+            # Initial constraints
+            ocp.subject_to(ocp.at_t0(x1) == 0)
+            ocp.subject_to(ocp.at_t0(x2) == 1)
+
+            # Pick an NLP solver backend
+            ocp.solver('ipopt')
+
+            # Pick a solution method
+            ocp.method(DirectCollocation(N=N,M=M,grid=grid))
+            
+            sol = ocp.solve()
+
+            [_,usol_control] = sol.sample(u,grid='control')
+            #[_,usol_integrator] = sol.sample(u,grid='integrator')
+            [_,usol_integrator_refine] = sol.sample(u,grid='integrator',refine=7)
+            #[_,usol_integrator_roots] = sol.sample(u,grid='integrator_roots')
+
+            assert_array_almost_equal(urefsol_control,usol_control)
+            #assert_array_almost_equal(urefsol_integrator,usol_integrator)
+            assert_array_almost_equal(urefsol_integrator_refine,usol_integrator_refine)
+            #assert_array_almost_equal(urefsol_integrator_roots,usol_integrator_roots)
+            # Set initial
+
+
 
 if __name__ == '__main__':
     unittest.main()

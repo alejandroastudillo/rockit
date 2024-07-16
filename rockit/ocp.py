@@ -26,7 +26,7 @@ from .casadi_helpers import vvcat, rockit_pickle_context, rockit_unpickle_contex
 from .external.manager import external_method
 from .direct_method import DirectMethod
 class Ocp(Stage):
-    def __init__(self,  t0=0, T=1, **kwargs):
+    def __init__(self,  t0=0, T=1, scale=1, **kwargs):
         """Create an Optimal Control Problem environment
 
         Parameters
@@ -37,13 +37,15 @@ class Ocp(Stage):
         T : float or :obj:`~rockit.freetime.FreeTime`, optional
             Total horizon of the optimal control horizon
             Default: 1
+        scale: float, optional
+               Typical time scale
 
         Examples
         --------
 
         >>> ocp = Ocp()
         """
-        Stage.__init__(self,  t0=t0, T=T, **kwargs)
+        Stage.__init__(self,  t0=t0, T=T, scale=scale, **kwargs)
         self._master = self
         # Flag to make solve() faster when solving a second time
         # (e.g. with different parameter values)
@@ -94,18 +96,22 @@ class Ocp(Stage):
         else:
             self._transcribe()
             return self
+        
+    def transcribe(self,**kwargs):
+        self._untranscribe()
+        self._transcribe(**kwargs)
 
-    def _transcribe(self):
+    def _transcribe(self,**kwargs):
         if not self.is_transcribed:
             self._transcribed_placeholders.clear()
-            self._transcribe_recurse(phase=0)
+            self._transcribe_recurse(phase=0,**kwargs)
             self._placeholders_transcribe_recurse(1,self._transcribed_placeholders)
-            self._transcribe_recurse(phase=1)
+            self._transcribe_recurse(phase=1,**kwargs)
             self._original._set_transcribed(True)
 
-            self._transcribe_recurse(phase=2,placeholders=self.placeholders_transcribed)
+            self._transcribe_recurse(phase=2,placeholders=self.placeholders_transcribed,**kwargs)
     
-    def _untranscribe(self):
+    def _untranscribe(self,**kwargs):
         if self.is_transcribed:
             self._transcribed_placeholders.clear()
             self._untranscribe_recurse(phase=0)
@@ -258,9 +264,13 @@ class Ocp(Stage):
         dae["ode"] = dt*ode
         dae["alg"] = alg
         dae["p"] = vertcat(self.u, t0, dt, p)
-        intg_options["t0"] = 0
-        intg_options["tf"] = 1
-        intg = integrator('intg',intg,dae,intg_options)
+
+        try:
+            intg = integrator('intg',intg,dae,0,1,intg_options)
+        except:
+            intg_options["t0"] = 0
+            intg_options["tf"] = 1
+            intg = integrator('intg',intg,dae,intg_options)
 
         z_initial_guess = MX.sym("z",self.z.sparsity()) if self.nz>0 else MX(0,1)
         

@@ -24,7 +24,8 @@ from .sampling_method import SamplingMethod
 from casadi import sumsqr, horzcat, vertcat, linspace, substitute, MX, evalf,\
                    vcat, collocation_points, collocation_interpolators, hcat,\
                    repmat, DM, sum2, mtimes, vvcat, depends_on, Function
-from .casadi_helpers import get_ranges_dict, HashOrderedDict, HashDict
+from .casadi_helpers import get_ranges_dict, HashOrderedDict, HashDict, is_numeric
+import casadi as ca
 from itertools import repeat
 try:
     from casadi import collocation_coeff
@@ -61,7 +62,9 @@ class DirectCollocation(SamplingMethod):
     def clean(self):
         SamplingMethod.clean(self)
         self.Zc = []  # List that will hold algebraic decision variables list(N,list(M,nz x degree))
-        self.Xc = []  # List that will hold helper collocation states
+        self.Xc = []  # List that will hold helper collocation states list(N,list(M, degree+1))
+        self.X_intg = []
+        self.Xc_pure = []
         self.Zc0 = []
         self.Xc_vars = []
         self.Xc_vars0 = []
@@ -78,6 +81,7 @@ class DirectCollocation(SamplingMethod):
         # is block-sparse
         x = opti.variable(stage.nx, scale=scale_x)
         self.X.append(x)
+        self.Q.append(DM.zeros(stage.nxq))
         self.add_variables_V(stage, opti)
         z = opti.variable(stage.nz, scale=scale_z)
         self.Zc_vars_base.append(z)
@@ -93,6 +97,8 @@ class DirectCollocation(SamplingMethod):
                 xr.append(xc)
                 zc = opti.variable(stage.nz, self.degree-1, scale=repmat(scale_z, 1, self.degree-1))
                 x0 = x if i==0 else opti.variable(stage.nx, scale=scale_x)
+                self.X_intg.append(x0)
+                self.Xc_pure.append(xc)
                 Xc.append(horzcat(x0, xc))
                 self.Xc_vars.append(xc if i==0 else horzcat(x0, xc))
                 self.Xc_vars0.append(repmat(x, 1, self.degree if i==0 else self.degree+1))
@@ -108,6 +114,7 @@ class DirectCollocation(SamplingMethod):
             self.Zc.append(Zc)
             x = opti.variable(stage.nx, scale=scale_x)
             self.X.append(x)
+            self.Q.append(None)
             z = opti.variable(stage.nz, scale=scale_z)
             self.Zc_vars_base.append(z)
             self.add_variables_V_control(stage, opti, k)
@@ -121,9 +128,12 @@ class DirectCollocation(SamplingMethod):
         self.add_variables_V_control_finalize(stage, opti)
 
     def add_constraints(self, stage, opti):
+        self.add_constraints_before(stage, opti)
         scale_x = stage._scale_x
         scale_der_x = stage._scale_der_x
         scale_z = stage._scale_z
+        self.poly_coeff_q = None
+
         # Obtain the discretised system
         f = stage._ode()
 
@@ -158,6 +168,19 @@ class DirectCollocation(SamplingMethod):
                 tr.append([self.integrator_grid[k][i]+dt*self.tau[j] for j in range(self.degree)])        
             self.tr.append(tr)
 
+        # Handle Bspline signals
+        subgrid = []
+        for i in range(self.M):
+            subgrid+=list((i+np.array(self.tau))/self.M)
+
+        v_sampled_store = []
+        for e in self.signals.values():
+            v_sampled = ca.horzsplit(e.sample(subgrid=subgrid,include_edges=False))
+            v_sampled_store.append(v_sampled)
+        signals_sampled = []
+        for i in range(len(subgrid*self.N)):
+            signals_sampled.append(ca.vertcat(*[e[i] for e in v_sampled_store]))
+
         dts = []
         # Fill in Z variables up-front, since they might be needed in constraints with ocp.next
         for k in range(self.N):
@@ -174,13 +197,17 @@ class DirectCollocation(SamplingMethod):
 
         self.Z.append(mtimes(self.Zc[-1][-1],sum2(poly_z)))
 
+        self.xqk.append(DM.zeros(stage.nxq))
+        count_f_eval = 0
         for k in range(self.N):
             dt = dts[k]
-            p = self.get_p_sys(stage,k)
+            p = self.get_p_sys(stage,k,include_signals=False)
             for i in range(self.M):
                 for j in range(self.degree):
                     Pidot_j = mtimes(self.Xc[k][i],self.C[:,j])/ dt
-                    res = f(x=self.Xc[k][i][:, j+1], u=self.U[k], z=self.Zc[k][i][:,j], p=p, t=self.tr[k][i][j])
+                    p_total = vertcat(p, signals_sampled[count_f_eval])
+                    res = f(x=self.Xc[k][i][:, j+1], u=self.U[k], z=self.Zc[k][i][:,j], p=p_total, t=self.tr[k][i][j])
+                    count_f_eval += 1
                     # Collocation constraints
                     opti.subject_to(Pidot_j == res["ode"], scale=scale_der_x)
                     self.q = self.q + res["quad"]*dt*self.B[j]
@@ -198,7 +225,7 @@ class DirectCollocation(SamplingMethod):
                     opti.subject_to(self.eval_at_integrator(stage, c, k, i), scale=args["scale"], meta=meta)
                 for c, meta, _ in stage._constraints["inf"]:
                     self.add_inf_constraints(stage, opti, c, k, i, meta)
-
+                self.xqk.append(self.q)
             for c, meta, args in stage._constraints["control"]:  # for each constraint expression
                 if k==0 and not args["include_first"]: continue
                 # Add it to the optimizer, but first make x,u concrete.
@@ -206,7 +233,7 @@ class DirectCollocation(SamplingMethod):
                     opti.subject_to(self.eval_at_control(stage, c, k), scale=args["scale"], meta=meta)
                 except IndexError:
                     pass # Can be caused by ocp.offset -> drop constraint
-
+            self.Q[k+1] = self.q
         for c, meta, args in stage._constraints["control"]:  # for each constraint expression
             if not args["include_last"]: continue
             # Add it to the optimizer, but first make x,u concrete.
@@ -230,19 +257,69 @@ class DirectCollocation(SamplingMethod):
             if a in algs:
                 initial_alg[a] = v
                 del initial[a]
-        SamplingMethod.set_initial(self,stage, opti, initial)
-        for a, v in list(initial_alg.items()):
+        for var, expr in initial.items():
+            if ca.is_equal(var, stage.T):
+                var = self.T
+            if ca.is_equal(var, stage.t0):
+                var = self.t0
+            is_states = depends_on(var, stage.x)
+            opti_initial = opti.initial()
+            if is_numeric(expr):
+                value = ca.evalf(expr)
+                # Row vector if vector
+                if value.is_column() and var.is_scalar(): value = value.T
+                if is_states:
+                    if var.numel()*(self.N)==value.numel() or var.numel()*(self.N+1)==value.numel():
+                        value_integrator = kron(DM.ones(1,self.M),value[:,:self.N])
+                        if var.numel()*(self.N+1)==value.numel(): value_integrator = horzcat(value_integrator.value[:,-1])
+                        value_integrator_root = kron(DM.ones(1,self.M*self.degree),value[:,:self.N])
+                    else:
+                        value_integrator = repmat(value,1,self.N*self.M+1)
+                        value_integrator_root = repmat(value,1,self.N*self.M*self.degree)
+            else:
+                if is_states:
+                    NUM = vertcat(DM(range(10)).T, DM(range(10,20)).T)
+                    expr_integrator = ca.hcat([self.eval_at_integrator(stage, expr, k, i) for k in list(range(self.N)) for i in range(self.M)]+[self.eval_at_control(stage, expr, -1)]) # HOT line
+                    expr_integrator_root = ca.hcat([self.eval_at_integrator_root(stage, expr, k, i, j) for k in list(range(self.N)) for i in range(self.M) for j in range(self.degree) ]) # HOT line
+                    value_integrator = DM(opti.debug.value(expr_integrator, opti_initial))
+                    value_integrator_root = DM(opti.debug.value(expr_integrator_root, opti_initial))
+                else:
+                    expr = ca.hcat([self.eval_at_control(stage, expr, k) for k in list(range(self.N))+[-1]]) # HOT line
+                    value = DM(opti.debug.value(expr, opti_initial))
+
+            if is_states:
+                target_integrator = ca.hcat([self.eval_at_integrator(stage, var, k, i) for k in list(range(self.N)) for i in range(self.M)]+[self.eval_at_control(stage, var, -1)])
+                opti.set_initial(target_integrator, value_integrator, cache_advanced=True)
+                target_integrator_root = ca.hcat([self.eval_at_integrator_root(stage, var, k, i, j) for k in list(range(self.N)) for i in range(self.M) for j in range(self.degree)]) # HOT line
+                opti.set_initial(target_integrator_root, value_integrator_root, cache_advanced=True)
+            else:
+                # Row vector if vector
+                if value.is_column() and var.is_scalar(): value = value.T
+                for k in list(range(self.N))+[-1]:
+                    target = self.eval_at_control(stage, var, k)
+                    value_k = value
+                    if target.numel()*(self.N)==value.numel() or target.numel()*(self.N+1)==value.numel():
+                        value_k = value[:,k]
+                    try:
+                        #print(target,value_k)
+                        opti.set_initial(target, value_k, cache_advanced=True)
+                    except Exception as e:
+                        # E.g for single shooting, set_initial of a state, for k>0
+                        # Error message is usually "... arbitrary expression ..." but can also be
+                        # "... You cannot set an initial value for a parameter ..."
+                        # if the dynamics contains a parameter
+                        if "arbitrary expression" in str(e) or (not target.is_valid_input() and "initial value for a parameter" in str(e)):
+                            pass
+                        else:
+                            # Other type of error: 
+                            raise e
+        for var, expr in list(initial_alg.items()):
             opti_initial = opti.initial()
             for k in range(self.N):
-                value = DM(opti.debug.value(self.eval_at_control(stage, v, k), opti_initial))
                 for i, e in enumerate(self.Zc[k]):
-                    e_shape = e[algs[a],:].shape
-                    value = DM(opti.debug.value(hcat([self.eval_at_integrator_root(stage, v, k, i, j) for j in range(e_shape[1])]), opti_initial))                    
-                    opti.set_initial(e[algs[a],:], value)
-        for k in range(self.N):
-            x0 = DM(opti.debug.value(self.X[k], opti.initial()))
-            for e in self.Xc[k]:
-                opti.set_initial(e, repmat(x0, 1, e.shape[1]//x0.shape[1]), cache_advanced=True)
+                    e_shape = e[algs[var],:].shape
+                    value = DM(opti.debug.value(hcat([self.eval_at_integrator_root(stage, expr, k, i, j) for j in range(e_shape[1])]), opti_initial))                    
+                    opti.set_initial(e[algs[var],:], value)
 
     def to_function(self, stage, name, args, results, *margs):
         args = list(args)

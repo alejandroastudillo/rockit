@@ -48,6 +48,7 @@ class SplineMethod(SamplingMethod):
         self.widths = None
         self.origins = None
         self.opti_advanced = None
+        self.Q = None
 
     def transcribe_start(self, stage, opti):
         # Inspect system
@@ -87,9 +88,10 @@ class SplineMethod(SamplingMethod):
             G.add_edge(node_x(r), node_x(c), weight=float(A[r,c]))
         for r,c in zip(*B.sparsity().get_triplet()):
             G.add_edge(node_x(r), node_u(c), weight=float(B[r,c]))
-        assert nx.is_forest(G)
-        assert len(list(nx.isolates(G)))==0
-
+        assert nx.number_of_nodes(G)==0 or nx.is_forest(G)
+        #nx.draw(G)
+        #import pylab as plt
+        #plt.show()
 
         chains = []
         for nodes in nx.weakly_connected_components(G):
@@ -166,13 +168,15 @@ ocp.set_der(v, a)
         """
 
         # Needed to make SamplingMethod happy
-        self.v = vvcat(stage.variables[''])
+        self.v = vvcat(stage.variables['']+stage.variables['bspline'])
         self.free_time = False
 
         self.constraint_inspector = ConstraintInspector(self, stage)
-        self.constraint_inspector.finalize()
 
         self.xu = ca.vertcat(stage.x,stage.u)
+
+    def transcribe_event_after_varpar(self, stage, phase=1, **kwargs):
+        self.constraint_inspector.finalize()
 
     def sample_xu(self, stage, refine):
         # Cache for B,tau and results
@@ -194,13 +198,14 @@ ocp.set_der(v, a)
         # We can construct all needed Bs upfront, regardless of groups
         # Store different Bs using width as a key
         # We need to cover the highest-order degree and all degrees lower than that
-        Lmax = max(self.groups.keys())
-        dmax = Lmax-1
-        for i in range(dmax+1):
-            d = dmax-i
-            [tau,B] = eval_on_knots(self.xi,dmax-i,subsamples=refine-1)
-            self.B[refine][self.N+d] = B
-            self.tau[refine] = tau
+        if self.groups:
+            Lmax = max(self.groups.keys())
+            dmax = Lmax-1
+            for i in range(dmax+1):
+                d = dmax-i
+                [tau,B] = eval_on_knots(self.xi,dmax-i,subsamples=refine-1)
+                self.B[refine][self.N+d] = B
+                self.tau[refine] = tau
         self.time[refine] = self.time_grid(self.t0, self.T, self.N*refine)
 
         # Evaluate spline on the control grid
@@ -229,10 +234,6 @@ ocp.set_der(v, a)
         assert not self.time_grid.localize_t0 and not self.time_grid.localize_T
 
         self.control_grid = self.time_grid(self.t0, self.T, self.N)
-
-        # Grid for B-spline
-        xi = DM(self.time_grid(0, 1, self.N)).T
-        self.xi = xi
 
         # Vectorized storage of coeffients and derivatives
         self.coeffs_and_der = defaultdict(list)
@@ -274,7 +275,7 @@ ocp.set_der(v, a)
                     self.coeffs_epxr[v_index] = esplit[k]
                 if d-i>0:
                     # Differentiate coefficient
-                    e = bspline_derivative(e,xi,d-i)/self.T
+                    e = bspline_derivative(e,self.xi,d-i)/self.T
         self.unique_widths = set(int(i) for i in self.widths.nonzeros())
 
         unique_refines = set([1]+[args["refine"] for _, _, args in stage._constraints["control"]])
@@ -284,8 +285,8 @@ ocp.set_der(v, a)
             self.sample_xu(stage, refine)
 
         # We can know store states and controls evaluated on the control grid
-        self.X = ca.horzsplit(ca.vcat(self.XU_sampled[1][:stage.nx]))
-        self.U = ca.horzsplit(ca.vcat(self.XU_sampled[1][stage.nx:]))[:-1]
+        self.X = ca.horzsplit(ca.vcat(self.XU_sampled[1][:stage.nx])) if stage.nx else [DM(0,1)]*(self.N+1)
+        self.U = ca.horzsplit(ca.vcat(self.XU_sampled[1][stage.nx:]))[:-1] if stage.nu else [DM(0,1)]*(self.N)
 
         # Below may improve efficiency, depends on the situation
         #self.X[0] = ca.vcat(self.XU0_expr[:stwidthstage.nx])
@@ -295,15 +296,35 @@ ocp.set_der(v, a)
         assert refine==1
         # What scalarized variables are we dependent on?
         v = self.xu
-        J = ca.jacobian(expr,v)
-        deps = ca.sum1(J.sparsity()).T.row()
-
-        widths = set([self.origins[i]["w"] for i in deps])
-        assert len(widths)==1
-        coeffs = ca.vcat([self.coeffs_epxr[i] for i in deps])
-        d = self.origins[deps[0]]["d"]
-        return self.t0+self.G[d]*self.T, coeffs
-
+        arg1 = v
+        arg2 = vvcat(self.signals.keys())
+        arg = ca.vertcat(arg1,arg2)
+        assert ca.is_linear(expr,arg)
+        Jf = ca.Function('Jf',[],ca.linear_coeff(expr,ca.vertcat(arg1,arg2)))
+        res = Jf.call([],False,False)
+        Js = ca.horzsplit(res[0],[0,arg1.numel(),arg.numel()])
+        bs = res[1]
+        for J in Js:
+            assert J.sparsity().is_selection(True)
+        has_entries = [e.nnz()>0 for e in Js]
+        assert has_entries.count(True)==1
+        if has_entries[0]:
+            deps = ca.sum1(Js[0].sparsity()).T.row()
+            Jmul = Js[0][:,deps]
+            widths = set([self.origins[i]["w"] for i in deps])
+            assert len(widths)==1
+            coeffs = ca.vcat([self.coeffs_epxr[i] for i in deps])
+            d = self.origins[deps[0]]["d"]
+            return self.t0+self.G[d]*self.T, (Jmul @ coeffs)+bs
+        elif has_entries[1]:
+            deps = ca.sum1(Js[1].sparsity()).T.row()
+            vars = vvcat(self.signals.keys())[deps]
+            Jmul = Js[1][:,deps]
+            s = self.signals[vars]
+            # Compute the degree and size of a BSpline coefficient needed
+            G = get_greville_points(self.xi, s.degree)
+            return self.t0+G*self.T, (Jmul @ s.coeff)+bs
+        
     def grid_control(self, stage, expr, grid, include_first=True, include_last=True, transpose=False, refine=1):
         # What scalarized variables are we dependent on?
         v = self.xu
@@ -352,17 +373,28 @@ ocp.set_der(v, a)
 
         # End offset modifications
 
-        f = ca.Function("f",v_symbols+[stage.p,stage.t],[expr])
-        F = f.map(self.N*refine+1-max_offset+min_offset,len(v_symbols)*[False]+ [True,False])
-        results = F(*v_expressions,stage.p,time)
+        fixed_parameters = MX(0, 1) if len(stage.parameters[''])==0 else vvcat(stage.parameters[''])
 
+        spline_symbols = vvcat(self.signals.keys())
+        spline_traj = []
+        for p,v in self.signals.items():
+            # Compute the degree and size of a BSpline coefficient needed
+            s = self.N+v.degree
+            assert p.size2()==1
+            [_,B] = eval_on_knots(self.xi,v.degree,subsamples=refine-1)
+            spline_traj.append(v.coeff @ B)
+        spline_traj = vcat(spline_traj)
+
+        f = ca.Function("f",v_symbols+[fixed_parameters,spline_symbols,stage.t],[expr])
+        F = f.map(self.N*refine+1-max_offset+min_offset,len(v_symbols)*[False]+ [True,False,False])
+        results = F(*v_expressions,fixed_parameters,spline_traj,time)
 
         return time, self.eval(stage, results)
 
 
 
-
     def add_constraints(self, stage, opti):
+        self.add_constraints_before(stage, opti)
         assert "integrator" not in stage._constraints
 
         self.opti_advanced = self.opti.advanced
@@ -478,29 +510,40 @@ ocp.set_der(v, a)
         ub = ca.vcat(ubs)
         canon = ca.vcat(canons)
 
-        A, b = linear_coeffs(canon, v)
+        A, Asignal, b = linear_coeffs(canon, v, vvcat(self.signals.keys()))
         A = evalf(A)
+        Asignal = evalf(Asignal)
         b = evalf(b)
 
-        # Goal is to put constraints on coefficients instead of on v
-        # However, different entries of v have different widths of coefficients
-        # Hence, we will have to add separate constraints for each width
+        assert A.nnz()==0 or Asignal.nnz()==0
 
-        # Partition constraints into blocks per width
-        for w in self.unique_widths:
-            # Selector for specific width
-            Sw = np.nonzero(self.widths==w)[0]
-            Ablock = A[:,Sw]
-            coeffs_epxr_block = [self.coeffs_epxr[e] for e in Sw]
-            # Selector for nonempty rows
-            Sr = ca.sum2(Ablock.sparsity()).row()
-            # Selector for nonempty columns
-            Sc = ca.sum1(Ablock.sparsity()).T.row()
-            Ablock = Ablock[Sr,Sc]
-            C = ca.vcat([coeffs_epxr_block[e] for e in Sc])
+        if A.nnz():
 
-            if Sr:
-                self.opti.subject_to(self.eval(stage,lb[Sr] - b[Sr] <= (Ablock @ C <= ub[Sr]-b[Sr])))
+            # Goal is to put constraints on coefficients instead of on v
+            # However, different entries of v have different widths of coefficients
+            # Hence, we will have to add separate constraints for each width
+
+            # Partition constraints into blocks per width
+            for w in self.unique_widths:
+                # Selector for specific width
+                Sw = np.nonzero(self.widths==w)[0]
+                Ablock = A[:,Sw]
+                coeffs_epxr_block = [self.coeffs_epxr[e] for e in Sw]
+                # Selector for nonempty rows
+                Sr = ca.sum2(Ablock.sparsity()).row()
+                # Selector for nonempty columns
+                Sc = ca.sum1(Ablock.sparsity()).T.row()
+                Ablock = Ablock[Sr,Sc]
+                C = ca.vcat([coeffs_epxr_block[e] for e in Sc])
+
+                if Sr:
+                    self.opti.subject_to(self.eval(stage,lb[Sr] - b[Sr] <= (Ablock @ C <= ub[Sr]-b[Sr])))
+        else:
+            deps = ca.sum1(Asignal).T.row()
+            vars = vvcat(self.signals.keys())[deps]
+            Jmul = Asignal[:,deps]
+            s = self.signals[vars]
+            self.opti.subject_to(self.eval(stage,lb - b <= (Jmul @ s.coeff <= ub-b)))
 
     def set_initial(self, stage, master, initial):
         opti = master.opti if hasattr(master, 'opti') else master

@@ -30,17 +30,29 @@ class MultipleShooting(SamplingMethod):
     def __init__(self, **kwargs):
         SamplingMethod.__init__(self, **kwargs)
 
+    def add_parameter(self, stage, opti):
+        SamplingMethod.add_parameter(self, stage, opti)
+        self.Z0 = []
+        for k in range(self.N):
+            es = []
+            for s in stage.algebraics:
+                e = opti.parameter(s.numel())
+                opti.set_value(e, 0)
+                es.append(e)
+            self.Z0.append(vcat(es))
+
     def add_variables(self, stage, opti):
         # We are creating variables in a special order such that the resulting constraint Jacobian
         # is block-sparse
         self.X.append(vcat([opti.variable(s.numel(), scale=vec(stage._scale[s])) for s in stage.states]))
         self.add_variables_V(stage, opti)
+        self.Q.append(DM.zeros(stage.nxq))
 
         for k in range(self.N):
-            self.U.append(vcat([opti.variable(s.numel(), scale=vec(stage._scale[s])) for s in stage.controls]) if stage.nu>0 else MX(0,1))
             self.add_variables_V_control(stage, opti, k)
+            self.U.append(vcat([opti.variable(s.numel(), scale=vec(stage._scale[s])) for s in stage.controls]) if stage.nu>0 else MX(0,1))
             self.X.append(vcat([opti.variable(s.numel(), scale=vec(stage._scale[s])) for s in stage.states]))
-            
+            self.Q.append(None)
 
         self.add_variables_V_control_finalize(stage, opti)
 
@@ -52,32 +64,43 @@ class MultipleShooting(SamplingMethod):
             self.poly_coeff = None
         if F.numel_out("poly_coeff_z")==0:
             self.poly_coeff_z = None
+        if F.numel_out("poly_coeff_q")==0:
+            self.poly_coeff_q = None
 
         self.q = 0
 
         FFs = []
+        self.xqk.append(DM.zeros(stage.nxq))
         # Fill in Z variables up-front, since they might be needed in constraints with ocp.next
         for k in range(self.N):
             FF = F(x0=self.X[k], u=self.U[k], t0=self.control_grid[k],
-                   T=self.control_grid[k + 1] - self.control_grid[k], p=self.get_p_sys(stage, k))
+                   T=self.control_grid[k + 1] - self.control_grid[k], p=self.get_p_sys(stage, k), z0=self.Z0[k])
             FFs.append(FF)
             # Save intermediate info
             poly_coeff_temp = FF["poly_coeff"]
+            poly_coeff_q_temp = FF["poly_coeff_q"]
             poly_coeff_z_temp = FF["poly_coeff_z"]
             xk_temp = FF["Xi"]
+            xqk_temp = self.q+FF["Qi"]
             zk_temp = FF["Zi"]
 
             # we cannot return a list from a casadi function
             self.xk.extend([xk_temp[:, i] for i in range(self.M)])
+            self.xqk.extend([xqk_temp[:, i] for i in range(self.M)])
             self.zk.extend([zk_temp[:, i] for i in range(self.M)])
             if k==0:
                 self.Z.append(zk_temp[:, 0])
             self.Z.append(FF["zf"])
             if self.poly_coeff is not None:
                 self.poly_coeff.extend(horzsplit(poly_coeff_temp, poly_coeff_temp.shape[1]//self.M))
+            if self.poly_coeff_q is not None:
+                self.poly_coeff_q.extend(horzsplit(poly_coeff_q_temp, poly_coeff_q_temp.shape[1]//self.M))
             if self.poly_coeff_z is not None:
                 self.poly_coeff_z.extend(horzsplit(poly_coeff_z_temp, poly_coeff_z_temp.shape[1]//self.M))
 
+            self.q = self.q + FF["qf"]
+            self.Q[k+1] = self.q
+   
         self.xk.append(self.X[-1])
         self.zk.append(self.zk[-1])
         scale_x = stage._scale_x
@@ -86,7 +109,12 @@ class MultipleShooting(SamplingMethod):
             FF = FFs[k]
             # Dynamic constraints a.k.a. gap-closing constraints
             opti.subject_to(self.X[k + 1] == FF["xf"], scale=scale_x)
-            self.q = self.q + FF["qf"]
+
+            self.add_coupling_constraints(stage, opti, k)
+
+            if k==0:
+                self.add_constraints_before(stage, opti)
+
 
             for l in range(self.M):
                 for c, meta, args in stage._constraints["integrator"]:
@@ -101,8 +129,8 @@ class MultipleShooting(SamplingMethod):
                     opti.subject_to(self.eval_at_control(stage, c, k), scale=args["scale"], meta=meta)
                 except IndexError:
                     pass # Can be caused by ocp.offset -> drop constraint
+            
 
-            self.add_coupling_constraints(stage, opti, k)
 
         for c, meta, args in stage._constraints["control"]+stage._constraints["integrator"]:  # for each constraint expression
             if not args["include_last"]: continue

@@ -22,6 +22,7 @@
 from casadi import MX, substitute, Function, vcat, depends_on, vertcat, jacobian, veccat, jtimes, hcat,\
                    linspace, DM, constpow, mtimes, low, floor, hcat, horzcat, DM, is_equal, \
                    Sparsity
+import casadi as ca
 from rockit.grouping_techniques import GroupingTechnique
 from .freetime import FreeTime
 from .direct_method import DirectMethod
@@ -43,6 +44,31 @@ def transcribed(func):
     function_wrapper.__doc__ = func.__doc__
     return function_wrapper
 
+class AbstractSignal:
+    def __init__(self, order):
+        self.order = order
+        self.derivative = None
+
+        # Initialization delegated to register
+        self.peers = None
+        self.symbol = None
+
+    @property
+    def der(self):
+        if self.derivative is None:
+            if self.order==0:
+                raise Exception("Cannot differentiate " + self.symbol.name() + " any further.")
+            der_symbol = MX.sym("der_"+self.symbol.name(), self.symbol.sparsity())
+            self.derivative = AbstractSignal(self.order-1)
+            AbstractSignal.register(self.peers, der_symbol, self.derivative)
+        return self.derivative.symbol
+    
+    @staticmethod
+    def register(peers, symbol, signal):
+        peers[symbol] = signal
+        signal.symbol = symbol
+        signal.peers = peers
+
 class Stage:
     """
         A stage is defined on a time domain and has particular system dynamics
@@ -50,7 +76,7 @@ class Stage:
 
         Each stage has a transcription method associated with it.
     """
-    def __init__(self, parent=None, t0=0, T=1, clone=False):
+    def __init__(self, parent=None, t0=0, T=1, scale=1, clone=False):
         """Create an Optimal Control Problem stage.
         
         Only call this constructer when you need abstract stages,
@@ -68,6 +94,8 @@ class Stage:
         T : float or :obj:`~rockit.freetime.FreeTime`, optional
             Total horizon of the stage
             Default: 1
+        scale: float, optional
+               Typical time scale
 
         Examples
         --------
@@ -81,6 +109,7 @@ class Stage:
         self.parameters = defaultdict(HashList)
         self.variables = defaultdict(HashList)
 
+
         self._master = parent.master if parent else None
         self.parent = parent
 
@@ -89,6 +118,7 @@ class Stage:
         self._var_original = None
         self._var_augmented = None
 
+        self._signals = HashOrderedDict()
         self._param_vals = HashDict()
         self._state_der = HashDict()
         self._scale_der = HashDict()
@@ -114,6 +144,7 @@ class Stage:
         self._tf = self.T + self.t0
         self._public_DT = self._create_placeholder_expr(0, 'DT')
         self._public_DT_control = self._create_placeholder_expr(0, 'DT_control')
+        self._T_scale = scale
 
     @property
     def master(self):
@@ -190,7 +221,7 @@ class Stage:
             return scale
 
     def state(self, n_rows=1, n_cols=1, quad=False, scale=1, meta=None):
-        """Create a state.
+        r"""Create a state.
         You must supply a derivative for the state with :obj:`~rockit.stage.Stage.set_der`
 
         Parameters
@@ -200,6 +231,11 @@ class Stage:
             Default: 1
         n_cols : int, optional
             Number of columns
+            Default: 1
+        scale : float or :obj:`~casadi.DM`, optional
+            Provide a nominal value of the state for numerical scaling
+            In essence, this has the same effect as defining x = scale*ocp.state(),
+            except that set_initial(x, ...) keeps working
             Default: 1
 
         Returns
@@ -276,7 +312,7 @@ class Stage:
         self._set_transcribed(False)
         return z
 
-    def variable(self, n_rows=1, n_cols=1, grid = '', scale=1, include_last=False, meta=None):
+    def variable(self, n_rows=1, n_cols=1, grid = '', order=0, scale=1, include_last=False, meta=None):
         """Create a variable
 
         Variables are unknowns in the Optimal Control problem
@@ -293,7 +329,11 @@ class Stage:
             over the whole optimal control horizon.
             For MultipleShooting, 'control' can be used to
             declare a variable that is unique to every control interval.
-            include_last determines if a unique entry is foreseen at the tf edge.
+            'bspline' indicates a bspline parametrization
+        order : int, optional
+            Relevant with grid='bspline'
+        include_last : bool, optional
+            Determines if a unique entry is foreseen at the tf edge.
 
 
         Returns
@@ -314,19 +354,21 @@ class Stage:
         L = sum([len(e) for e in self.variables.values()])
         v = MX.sym("v"+str(L+1), n_rows, n_cols)
         meta = merge_meta(meta, get_meta())
-        return self.register_variable(v, grid=grid, scale=scale, meta=meta, include_last=include_last)
+        return self.register_variable(v, grid=grid, order=order, scale=scale, meta=meta, include_last=include_last)
 
-    def register_variable(self, v, grid = '', scale=1, include_last=False, meta=None):
+    def register_variable(self, v, grid = '', order=0, scale=1, include_last=False, meta=None):
         if isinstance(v, list):
             for e in v:
                 self.register_variable(e, scale=scale)
             return
         self._meta[v] = merge_meta(meta, get_meta())
         self._scale[v] = self._parse_scale(v, scale)
-        self._catalog[v] = {"type": 'variables', "sparsity": v.sparsity(), "grid": grid, "include_last": include_last}
+        self._catalog[v] = {"type": 'variables', "sparsity": v.sparsity(), "grid": grid, "include_last": include_last, "order": order}
         if include_last:
             grid+="+"
         self.variables[grid].append(v)
+        if grid=='bspline':
+            AbstractSignal.register(self._signals, v, AbstractSignal(order))
         self._set_transcribed(False)
         return v
     
@@ -339,9 +381,11 @@ class Stage:
             ret["include_last"] = data["include_last"]
         if "grid" in data:
             ret["grid"] = data["grid"]
+        if "order" in data:
+            ret["order"] = data["order"]
         return ret
 
-    def parameter(self, n_rows=1, n_cols=1, grid = '', scale=1, include_last=False, meta=None):
+    def parameter(self, n_rows=1, n_cols=1, grid = '', order=0, scale=1, include_last=False, meta=None):
         """Create a parameter
 
         Parameters are symbols of an Optimal COntrol problem
@@ -384,19 +428,21 @@ class Stage:
         L = sum([len(e) for e in self.parameters.values()])
         p = MX.sym("p"+str(L+1), n_rows, n_cols)
         meta = merge_meta(meta, get_meta())
-        return self.register_parameter(p, grid=grid, scale=scale, include_last=include_last, meta=meta)
+        return self.register_parameter(p, grid=grid, order=order, scale=scale, include_last=include_last, meta=meta)
 
-    def register_parameter(self, p, grid='', scale=1, include_last=False, meta=None):
+    def register_parameter(self, p, grid='', order=0, scale=1, include_last=False, meta=None):
         if isinstance(p,list):
             for e in p:
                 self.register_parameter(e, scale=scale)
             return
         self._meta[p] = merge_meta(meta, get_meta())
         self._scale[p] = self._parse_scale(p, scale)
-        self._catalog[p] = {"type": 'variables', "sparsity": p.sparsity(), "grid": grid, "include_last": include_last}
+        self._catalog[p] = {"type": 'variables', "sparsity": p.sparsity(), "grid": grid, "include_last": include_last, "order": order}
         if include_last:
             grid+="+"
         self.parameters[grid].append(p)
+        if grid=='bspline':
+            AbstractSignal.register(self._signals, p, AbstractSignal(order))
         self._set_transcribed(False)
         return p
 
@@ -414,6 +460,11 @@ class Stage:
             Number of columns
         order : int, optional
             Order of polynomial. order=0 denotes a constant.
+        scale : float or :obj:`~casadi.DM`, optional
+            Provide a nominal value of the state for numerical scaling
+            In essence, this has the same effect as defining u = scale*ocp.control(),
+            except that set_initial(u, ...) keeps working
+            Default: 1
         Returns
         -------
         s : :obj:`~casadi.MX`
@@ -539,7 +590,7 @@ class Stage:
             self._method.set_initial(self._augmented, self.master._method, self._initial)
 
     def set_der(self, state, der, scale=1):
-        """Assign a right-hand side to a state derivative
+        r"""Assign a right-hand side to a state derivative
 
         Parameters
         ----------
@@ -548,6 +599,7 @@ class Stage:
             May not be an indexed or sliced state
         der : `~casadi.MX`
             A CasADi symbolic expression of the same size as `state`
+        scale : extra scaling after scaling of state has been applied
 
         Examples
         --------
@@ -599,11 +651,14 @@ class Stage:
         self._alg.append(constr/scale)
 
     def der(self, expr):
+        symbols = ca.symvar(expr)
+        nominal_symbols = [e for e in symbols if e in self._signals]
+        der_symbols = [self._signals[e].der for e in symbols if e in self._signals]
         if depends_on(expr, self.u):
             raise Exception("Dependency on controls not supported yet for stage.der")
         ode = self._ode()
-        if depends_on(expr,self.t):
-            return jtimes(expr, vertcat(self.x, self.t), vertcat(ode(x=self.x, u=self.u, z=self.z, p=vertcat(self.p, self.v), t=self.t)["ode"], 1))
+        if depends_on(expr,self.t) or nominal_symbols:
+            return jtimes(expr, vertcat(self.x, self.t, *nominal_symbols), vertcat(ode(x=self.x, u=self.u, z=self.z, p=vertcat(self.p, self.v), t=self.t)["ode"], 1, *der_symbols))
         else:
             if expr in self.states:
                 return jtimes(expr, self.x, ode.call(dict(x=self.x, u=self.u, z=self.z, p=vertcat(self.p, self.v), t=self.t),True,False)["ode"])
@@ -611,7 +666,7 @@ class Stage:
                 return jtimes(expr, self.x, ode(x=self.x, u=self.u, z=self.z, p=vertcat(self.p, self.v), t=self.t)["ode"])
 
 
-    def integral(self, expr, grid='inf'):
+    def integral(self, expr, grid='inf',refine=1):
         """Compute an integral or a sum
 
         Parameters
@@ -628,7 +683,7 @@ class Stage:
         if grid=='inf':
             return self._create_placeholder_expr(expr, 'integral')
         else:
-            return self._create_placeholder_expr(expr, 'integral_control')
+            return self._create_placeholder_expr(expr, 'integral_control', refine=refine)
 
     def sum(self, expr, grid='control', include_last=False):
         """Compute a sum
@@ -739,6 +794,12 @@ class Stage:
             Group vector-valued constraints along the vector dimension into a scalar constraint
         group_control : GroupTechnique, optional
             Group constraints together along the control grid
+
+        scale : float or :obj:`~casadi.DM`, optional
+            Provide a nominal value for this constraint
+            In essence, this has the same effect as dividing all sides of the constraints by scale
+            Default: 1
+
         Examples
         --------
 
@@ -759,8 +820,7 @@ class Stage:
             if grid == 'point':
                 raise Exception("Got a signal expression for grid 'point'.")
         else:
-            if grid != 'point': 
-                raise Exception("Expected signal expression since grid '" + grid + "' was given.")
+            grid = 'point'
         
         scale = self._parse_scale(constr, scale)
         args = {"grid": grid, "include_last": include_last, "include_first": include_first, "scale": scale, "refine": refine, "group_refine": group_refine, "group_dim": group_dim, "group_control": group_control}
@@ -884,17 +944,93 @@ class Stage:
 
     @property
     def p(self):
-        arg = self.parameters['']+self.parameters['control']+self.parameters['control+']
+        arg = self.parameters['']+self.parameters['control']+self.parameters['control+']+self.parameters['bspline']
         return MX(0, 1) if len(arg)==0 else vvcat(arg)
 
     @property
     def v(self):
-        arg = self.variables['']+self.variables['control']+self.variables['control+']
+        arg = self.variables['']+self.variables['control']+self.variables['control+']+self.variables['bspline']
         return MX(0, 1) if len(arg)==0 else vvcat(arg)
+
+    @property
+    def p_global_list(self): return self.parameters['']
+
+    @property
+    def p_control_list(self): return self.parameters['control']+self.parameters['control+']
+
+    @property
+    def p_integrator_list(self): return self.parameters['integrator']+self.parameters['integrator+']
+
+    @property
+    def p_integrator_roots_list(self): return self.parameters['bspline']
+    
+    @property
+    def v_global_list(self): return self.variables['']
+
+    @property
+    def v_control_list(self): return self.variables['control']+self.variables['control+']
+
+    @property
+    def v_integrator_list(self): return self.variables['integrator']+self.variables['integrator+']
+
+    @property
+    def v_integrator_roots_list(self): return self.variables['bspline']
+
+    @property
+    def p_global(self): return MX(0, 1) if len(self.p_global_list)==0 else vvcat(self.p_global_list)
+
+    @property
+    def p_control(self): return MX(0, 1) if len(self.p_control_list)==0 else vvcat(self.p_control_list)
+    
+    @property
+    def p_integrator(self): return MX(0, 1) if len(self.p_integrator_list)==0 else vvcat(self.p_integrator_list)
+
+    @property
+    def p_integrator_roots(self): return MX(0, 1) if len(self.p_integrator_roots_list)==0 else vvcat(self.p_integrator_roots_list)
+
+    @property
+    def v_global(self): return MX(0, 1) if len(self.v_global_list)==0 else vvcat(self.v_global_list)
+
+    @property
+    def v_control(self): return MX(0, 1) if len(self.v_control_list)==0 else vvcat(self.v_control_list)
+    
+    @property
+    def v_integrator(self): return MX(0, 1) if len(self.v_integrator_list)==0 else vvcat(self.v_integrator_list)
+
+    @property
+    def v_integrator_roots(self): return MX(0, 1) if len(self.v_integrator_roots_list)==0 else vvcat(self.v_integrator_roots_list)
+    
+    @property
+    def pv_global(self): return ca.vertcat(self.p_global, self.v_global)
+
+    @property
+    def pv_control(self): return ca.vertcat(self.p_control, self.v_control)
+
+    @property
+    def pv_integrator(self): return ca.vertcat(self.p_integrator, self.v_integrator)
+
+    @property
+    def pv_integrator_roots(self): return ca.vertcat(self.p_integrator_roots, self.v_integrator_roots)
+
+    @property
+    def npv_global(self): return self.pv_global.numel()
+
+    @property
+    def npv_control(self): return self.pv_control.numel()
+
+    @property
+    def npv_integrator(self): return self.pv_integrator.numel()
+
+    @property
+    def npv_integrator_roots(self): return self.pv_integrator_roots.numel()
 
     @property
     def nx(self):
         return self.x.numel()
+
+    @property
+    def nxq(self):
+        return self.xq.numel()
 
     @property
     def nz(self):
@@ -930,11 +1066,11 @@ class Stage:
 
     @property
     def _scale_p(self):
-        return vvcat([self._scale[p] for p in self.parameters['']+self.parameters['control']+self.parameters['control+']])
+        return vvcat([self._scale[p] for p in self.parameters['']+self.parameters['control']+self.parameters['control+']+self.parameters['bspline']])
 
     @property
     def _scale_v(self):
-        return vvcat([self._scale[v] for v in self.variables['']+self.variables['control']+self.variables['control+']])
+        return vvcat([self._scale[v] for v in self.variables['']+self.variables['control']+self.variables['control+']+self.variables['bspline']])
 
     @property
     def gist(self):
@@ -958,7 +1094,7 @@ class Stage:
 
         """
  
-        return depends_on(expr, vertcat(self.x, self.u, self.z, self.t, self.DT, self.DT_control, vcat(self.parameters['control']+self.parameters['control+']), vcat(self.variables['control']+self.variables['control+']+self.variables['states']), vvcat(self._inf_der.keys())))
+        return depends_on(expr, vertcat(self.x, self.u, self.z, self.t, self.DT, self.DT_control, vcat(self.parameters['control']+self.parameters['control+']), vcat(self.variables['control']+self.variables['control+']+self.variables['states']),vvcat(self._signals.keys()), vvcat(self._inf_der.keys())))
 
     def is_parametric(self, expr):
         """Does the expression depend only on parameters?
@@ -971,7 +1107,7 @@ class Stage:
  
         return not depends_on(expr, vertcat(self.x, self.u, self.z, self.t, vcat(self.variables['']+self.variables['control']+self.variables['control+']+self.variables['states']), vvcat(self._inf_der.keys())))
 
-    def _create_placeholder_expr(self, expr, callback_name):
+    def _create_placeholder_expr(self, expr, callback_name, *args, **kwargs):
         """
         Placeholders are transcribed in two phases
            Phase 1: before any decision variables are created
@@ -980,7 +1116,7 @@ class Stage:
 
         """
         r = MX.sym("r_" + callback_name, MX(expr).sparsity())
-        self._placeholders[r] = (callback_name, expr)
+        self._placeholders[r] = (callback_name, expr, args, kwargs)
         if self.master is not None:
             self.master._transcribed_placeholders.mark_dirty()
         return r
@@ -1006,7 +1142,7 @@ class Stage:
             return ret
 
         def do(tag=None):
-            ret = prefix(normalize(callback(phase, self, expr)),tag)
+            ret = prefix(normalize(callback(phase, self, expr, *args, **kwargs)),tag)
             if ret is not None:
                 placeholders[phase][symbol] = ret
                 if phase==2 and isinstance(expr,MX) and expr.is_symbolic() and symbol in placeholders[phase-1]:
@@ -1015,7 +1151,7 @@ class Stage:
         # Phase 1 may introduce extra placeholders
         while True:
             len_before = len(self._placeholders)
-            for symbol, (species,expr) in list(self._placeholders.items()):
+            for symbol, (species,expr,args,kwargs) in list(self._placeholders.items()):
                 if symbol not in placeholders[phase]:
                     callback = getattr(method, 'fill_placeholders_' + species)
                     if phase==2 and symbol in placeholders[phase-1]:
@@ -1074,7 +1210,7 @@ class Stage:
         t = self.t
         if not depends_on(vertcat(next,quad), self.t):
             t = MX.sym('t', Sparsity(1, 1))
-        return Function('diffeq', [self.x, self.u, vertcat(self.p, self.v), t, self.DT, self.DT_control], [next, MX(), quad, MX(0, 1), MX()], ["x0", "u", "p", "t0", "DT", "DT_control"], ["xf","poly_coeff","qf","zf","poly_coeff_z"])
+        return Function('diffeq', [self.x, self.u, vertcat(self.p, self.v), t, self.DT, self.DT_control, MX(0,1)], [next, MX(), quad, MX(), MX(0, 1), MX()], ["x0", "u", "p", "t0", "DT", "DT_control","z0"], ["xf","poly_coeff","qf","poly_coeff_q","zf","poly_coeff_z"])
 
     def _expr_apply(self, expr, **kwargs):
         """
@@ -1146,6 +1282,12 @@ class Stage:
             v = veccat(*self.variables['states'])
             subst_from.append(v)
             subst_to.append(kwargs["v_states"])
+        if "signals" in kwargs:
+            signals, values = kwargs["signals"]
+            if signals:
+                p = vvcat(signals.keys())
+                subst_from.append(p)
+                subst_to.append(values)
         return (subst_from, subst_to)
 
     _constr_apply = _expr_apply
@@ -1258,6 +1400,7 @@ class Stage:
         ret._offsets = deepcopy(self._offsets)
         ret._param_vals = copy(self._param_vals)
         ret._state_der = copy(self._state_der)
+        ret._scale_der = copy(self._scale_der)
         ret._alg = copy(self._alg)
         ret._state_next = copy(self._state_next)
         constr_types = self._constraints.keys()
@@ -1292,6 +1435,7 @@ class Stage:
         ret._catalog = self._catalog
 
         ret._var_is_transcribed = False
+        ret._T_scale = self._T_scale
         return ret
 
     def __deepcopy__(self, memo):
@@ -1360,6 +1504,10 @@ class Stage:
         >>> tx, xs = sol.sample(x, grid='control')
         """
         placeholders = self.master.placeholders_transcribed
+        time, res = self._sample(expr, grid=grid, **kwargs)
+        return placeholders(time), placeholders(res)
+    
+    def _sample(self, expr, grid='control', **kwargs):
         grid, include_first, include_last = self._parse_grid(grid)
         kwargs["include_first"] = include_first
         kwargs["include_last"] = include_last
@@ -1368,7 +1516,7 @@ class Stage:
         elif grid == 'control-':
             time, res = self._grid_control(self, expr, grid, include_last=False, **kwargs)
         elif grid == 'integrator':
-            if 'refine' in kwargs:
+            if 'refine' in kwargs and kwargs["refine"] is not None:
                 time, res = self._grid_intg_fine(self, expr, grid, **kwargs)
             else:
                 time, res = self._grid_integrator(self, expr, grid, **kwargs)
@@ -1381,7 +1529,7 @@ class Stage:
             msg += "Options are: 'control' or 'integrator' with an optional extra refine=<int> argument."
             raise Exception(msg)
 
-        return placeholders(time), placeholders(res)
+        return time, res
 
     def _grid_gist(self, stage, expr, grid, include_first=True, include_last=True, transpose=False, refine=1):
         if hasattr(stage._method,"grid_gist"):
@@ -1440,17 +1588,38 @@ class Stage:
         """Evaluate expression at extra fine integrator discretization points."""
         assert include_first
         assert include_last
-        if stage._method.poly_coeff is None:
+        if depends_on(expr,stage.x) and stage._method.poly_coeff is None:
             msg = "No polynomal coefficients for the {} integration method".format(stage._method.intg)
+            raise Exception(msg)
+        if depends_on(expr,stage.xq) and stage._method.poly_coeff_q is None:
+            msg = "No quadrature polynomal coefficients for the {} integration method".format(stage._method.intg)
             raise Exception(msg)
         N, M = stage._method.N, stage._method.M
 
-        expr_f = Function('expr', [stage.t, stage.x, stage.z, stage.u, vertcat(stage.p, stage.v), stage.t0, stage.T], [expr])
+        expr_f = Function('expr', [stage.t, stage.x, stage.xq, stage.z, stage.u, vertcat(stage.p, stage.v), stage.t0, stage.T], [expr])
         assert not expr_f.has_free(), str(expr_f.free_mx())
+
+
+        # Handle Bspline signals
+        subgrid = list(np.linspace(0, 1, M*refine+1))[:-1]
+
+        v_sampled_store = []
+        for e in stage._method.signals.values():
+            v_sampled = ca.horzsplit(e.sample(subgrid=subgrid,include_edges=False), refine)
+            v_sampled_store.append(v_sampled)
+        
+        signals_sampled = []
+        for i in range(M*N):
+            if stage._method.signals:
+                signals_sampled.append(ca.vertcat(*[e[i] for e in v_sampled_store]))
+            else:
+                signals_sampled.append(ca.DM(0,refine))
 
         time = stage._method.control_grid
         total_time = []
         sub_expr = []
+        count_blocks = 0
+        q_start = 0
         for k in range(N):
             t0 = time[k]
             dt = (time[k+1]-time[k])/M
@@ -1460,8 +1629,10 @@ class Stage:
             for l in range(M):
                 local_t = t0+tlocal[:-1]
                 total_time.append(local_t)
-                coeff = stage._method.poly_coeff[k * M + l]
-                tpower = hcat([constpow(ts,i) for i in range(coeff.shape[1])]).T
+                coeff = None if stage._method.poly_coeff is None else stage._method.poly_coeff[k * M + l]
+                coeff_q = None if stage._method.poly_coeff_q is None else horzcat(stage._method.xqk[k * M + l], stage._method.poly_coeff_q[k * M + l])
+                either_coeff = coeff_q if coeff is None else coeff
+                tpower = None if either_coeff is None else hcat([constpow(ts,i) for i in range(either_coeff.shape[1])]).T
                 if stage._method.poly_coeff_z:
                     coeff_z = stage._method.poly_coeff_z[k * M + l]
                     tpower_z = hcat([constpow(ts,i) for i in range(coeff_z.shape[1])]).T
@@ -1469,13 +1640,18 @@ class Stage:
                 else:
                     z = nan
 
-                pv = stage._method.get_p_sys(stage,k)
-                sub_expr.append(stage._method.eval_at_integrator(stage, expr_f(local_t.T, mtimes(coeff,tpower), z, stage._method.U[k], pv, stage._method.t0, stage._method.T), k, l))
+                pv = stage._method.get_p_sys(stage,k,include_signals=False)
+                if stage._method.signals:
+                    pv = ca.vertcat(ca.repmat(pv,1,refine),signals_sampled[count_blocks])
+                sub_expr.append(stage._method.eval_at_integrator(stage, expr_f(local_t.T, nan if coeff is None else mtimes(coeff,tpower), nan if coeff_q is None else mtimes(coeff_q,tpower), z, stage._method.U[k], pv, stage._method.t0, stage._method.T), k, l))
                 t0+=dt
+                count_blocks+=1
+            q_start += stage._method.xqk[k]
 
         ts = tlocal[-1,:]
         total_time.append(time[k+1])
-        tpower = hcat([constpow(ts,i) for i in range(coeff.shape[1])]).T
+        either_coeff = coeff_q if coeff is None else coeff
+        tpower = None if either_coeff is None else hcat([constpow(ts,i) for i in range(either_coeff.shape[1])]).T
         if stage._method.poly_coeff_z:
             tpower_z = hcat([constpow(ts,i) for i in range(coeff_z.shape[1])]).T
             z = mtimes(coeff_z,tpower_z)
@@ -1483,7 +1659,7 @@ class Stage:
             z = nan
 
         pv = stage._method.get_p_sys(stage,-1)
-        sub_expr.append(stage._method.eval_at_integrator(stage, expr_f(time[k+1], mtimes(stage._method.poly_coeff[-1],tpower), z, stage._method.U[-1], pv, stage._method.t0, stage._method.T), k, l))
+        sub_expr.append(stage._method.eval_at_integrator(stage, expr_f(time[k+1], nan if coeff is None else mtimes(stage._method.poly_coeff[-1],tpower), nan if coeff_q is None else mtimes(horzcat(stage._method.xqk[-2],stage._method.poly_coeff_q[-1]),tpower), z, stage._method.U[-1], pv, stage._method.t0, stage._method.T), k, l))
 
         return vcat(total_time), hcat(sub_expr)
 
